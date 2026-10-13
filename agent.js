@@ -37,6 +37,7 @@ const os = require("node:os");
 const path = require("node:path");
 const readline = require("node:readline");
 const { StringDecoder } = require("node:string_decoder");
+const { createChatClient } = require("./api-client");
 
 // =====================================================================
 // 一、参数解析（放在最前面，保证 --help / --show-memory 不需要 API 配置）
@@ -92,7 +93,7 @@ const HELP_TEXT = `Skymind —— 基于 OpenAI 兼容接口的终端 AI 智能�
 
 经验记忆保存在: ~/.10xagent/memory.md（跨会话自改进）`;
 
-if (FLAGS.help) { console.log(HELP_TEXT); process.exit(0); }
+if (require.main === module && FLAGS.help) { console.log(HELP_TEXT); process.exit(0); }
 
 // =====================================================================
 // 二、自改进记忆（跨会话经验沉淀）
@@ -116,7 +117,7 @@ const saveMemory = content => {
   fs.writeFileSync(MEMORY_PATH, content.trim() + "\n", "utf8");
 };
 
-if (FLAGS.showMemory) {
+if (require.main === module && FLAGS.showMemory) {
   console.log(loadMemory() || "（记忆库为空）");
   process.exit(0);
 }
@@ -144,37 +145,15 @@ const loadConfig = () => {
   return cfg;
 };
 
-const cfg = loadConfig();
+const cfg = require.main === module ? loadConfig() : {};
 // 环境变量优先级最高，覆盖文件配置
 const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || cfg.OPENAI_BASE_URL;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || cfg.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || cfg.OPENAI_MODEL;
 
-if (!OPENAI_BASE_URL || !OPENAI_API_KEY || !OPENAI_MODEL) {
-  console.error(
-    "缺少配置：请设置 OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL 环境变量，" +
-    "或确保 ~/.codex/config.toml（或 auth.json）中存在对应配置。"
-  );
-  process.exit(1);
-}
-
-// 小工具函数：延时
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-
 // =====================================================================
 // 四、LLM 调用（带重试、超时、可中断、工具定义）
 // =====================================================================
-const API_TIMEOUT_MS = 300_000; // 单次请求超时上限：5 分钟
-
-// 把模型返回的 content 统一转成字符串。
-// 有些兼容网关（如 Anthropic 风格）会返回数组形式的分块内容，必须兼容。
-const toText = v => {
-  if (v == null) return "";
-  if (typeof v === "string") return v;
-  if (Array.isArray(v)) return v.map(p => p.text ?? (typeof p === "string" ? p : JSON.stringify(p))).join("");
-  return String(v);
-};
-
 // 定义 bash 工具描述（交给模型的 JSON Schema）
 const TOOL_DEFINITION = {
   type: "function",
@@ -190,55 +169,13 @@ const TOOL_DEFINITION = {
   },
 };
 
-// 核心请求函数。
-// @param useTools=false 时发送纯对话请求（用于反思），避免模型在反思时乱调工具
-// @param signal        外部 AbortSignal，用户中断任务时终止本次请求
-const call = async (messages, { useTools = true, signal = null } = {}) => {
-  let lastErr;
-  for (let attempt = 1; attempt <= 3; attempt++) { // 最多重试 3 次
-    const controller = new AbortController();
-    // 外部信号（用户 Ctrl+C）能直接中止本次网络请求
-    if (signal) {
-      if (signal.aborted) controller.abort();
-      else signal.addEventListener("abort", () => controller.abort(), { once: true });
-    }
-    const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS); // 超时保护
-    try {
-      const body = { model: OPENAI_MODEL, messages };
-      if (useTools) {
-        body.tool_choice = "auto"; // 是否用工具由模型自行决定
-        body.tools = [TOOL_DEFINITION];
-      }
-      const res = await fetch(`${OPENAI_BASE_URL}/chat/completions`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal, // 传 AbortSignal 实现超时中断
-      });
-      clearTimeout(timer);
-      const data = await res.json();
-      if (!res.ok) {
-        lastErr = new Error(`API 请求失败 (HTTP ${res.status}): ${JSON.stringify(data).slice(0, 500)}`);
-      } else if (!data.choices?.length) {
-        lastErr = new Error(`API 响应异常，缺少 choices: ${JSON.stringify(data).slice(0, 500)}`);
-      } else {
-        const msg = data.choices[0].message;
-        // 统一标准化返回：content 转字符串，tool_calls 缺省为空数组
-        return { role: "assistant", content: toText(msg.content), tool_calls: msg.tool_calls ?? [] };
-      }
-    } catch (err) {
-      clearTimeout(timer);
-      lastErr = err.name === "AbortError"
-        ? new Error(signal?.aborted ? "任务已中断" : `请求超时（${API_TIMEOUT_MS / 1000} 秒）`)
-        : err;
-    }
-    if (attempt < 3) await sleep(1000 * attempt); // 指数退避：1s、2s
-  }
-  throw lastErr;
-};
+// 请求超时、重试和中断由共享客户端处理。
+const call = createChatClient({
+  baseUrl: OPENAI_BASE_URL || "",
+  apiKey: OPENAI_API_KEY,
+  model: OPENAI_MODEL,
+  toolDefinition: TOOL_DEFINITION,
+});
 
 // 纯对话补全（不带工具），供反思使用
 const callPlain = async (messages, signal = null) => {
@@ -419,6 +356,7 @@ const runAgent = async ({ task, options = {}, callbacks = {}, signal = null }) =
     // ---------- 第 2 步：执行本轮所有工具调用（支持并行，逐个处理） ----------
     const toolResults = [];
     for (const tc of m.tool_calls) {
+      if (aborted()) break;
       // 2.1 工具名校验：只允许 bash
       if (tc.function?.name !== "bash") {
         toolResults.push({ tool_call_id: tc.id, content: `[不支持的工具] ${tc.function?.name}` });
@@ -458,6 +396,7 @@ const runAgent = async ({ task, options = {}, callbacks = {}, signal = null }) =
       // 2.5 危险命令确认（除非 --yes；onConfirm 由界面层实现）
       if (isDangerous(cmd) && !opts.yes) {
         const ok = await cb.onConfirm(cmd);
+        if (aborted()) break;
         if (!ok) {
           toolResults.push({
             tool_call_id: tc.id,
@@ -481,7 +420,7 @@ const runAgent = async ({ task, options = {}, callbacks = {}, signal = null }) =
 
   // 达到最大轮数仍没得到最终答复时，明确告知用户（而不是静默退出）
   if (!finalAnswer) {
-    finalAnswer = `[已达最大工具轮数(${opts.maxSteps})，未得到最终答复]`;
+    finalAnswer = aborted() ? "[已中断] 任务被用户中止。" : `[已达最大工具轮数(${opts.maxSteps})，未得到最终答复]`;
     cb.onAnswer(finalAnswer);
   }
 
@@ -705,9 +644,12 @@ class TUI {
     // ---- 确认模式：y / n 决定危险命令去留 ----
     if (this.mode === "confirm") {
       if (key === "y" || key === "Y") this.confirmCtx?.resolve(true);
-      else if (key === "n" || key === "N" || key === "\x03" || key === "\x1b") this.confirmCtx?.resolve(false);
+      else if (key === "n" || key === "N" || key === "\x03" || key === "\x1b") {
+        if (key === "\x03") this.abort.abort();
+        this.confirmCtx?.resolve(false);
+      }
       else return;
-      this.mode = "idle";
+      this.mode = "running";
       this.confirmCtx = null;
       this.render();
       return;
@@ -773,6 +715,7 @@ class TUI {
 
   // ---------- 任务执行 ----------
   submit() {
+    if (this.running || this.mode !== "idle") return;
     const task = this.input.trim();
     if (!task) return;
     this.history.push(task);
@@ -815,7 +758,8 @@ class TUI {
       else this.appendLog("system", `✓ 任务结束（答复长度 ${width(answer)} 字符），可继续输入新任务。`);
     } catch (err) {
       this.thinking = false;
-      this.appendLog("error", `执行失败: ${err.message}`);
+      if (this.abort.signal.aborted) this.appendLog("system", "✓ 任务已中断");
+      else this.appendLog("error", `执行失败: ${err.message}`);
     } finally {
       clearInterval(this.timer);
       this.timer = null;
@@ -940,6 +884,13 @@ const runCLI = async task => {
 // 十一、入口：模式分发
 // =====================================================================
 const main = async () => {
+  if (!OPENAI_BASE_URL || !OPENAI_API_KEY || !OPENAI_MODEL) {
+    console.error(
+      "缺少配置：请设置 OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL 环境变量，" +
+      "或确保 ~/.codex/config.toml（或 auth.json）中存在对应配置。"
+    );
+    process.exit(1);
+  }
   const task = USER_PROMPT;
   const wantTui = FLAGS.forceTui || (!FLAGS.forceCli && !task && process.stdin.isTTY);
   if (wantTui) {
@@ -953,7 +904,9 @@ const main = async () => {
 };
 
 // 顶层兜底：任何未捕获的错误都给出友好提示 + 非零退出码
-main().catch(err => {
+if (require.main === module) main().catch(err => {
   console.error(`\n[错误] 执行失败: ${err.message}`);
   process.exit(1);
 });
+
+module.exports = { TUI, charWidth };
