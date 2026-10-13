@@ -46,7 +46,7 @@ skymind "帮我统计当前目录有多少个文件"   # 单次执行（CLI 模�
 | `--no-learn` | 任务结束后跳过反思学习（省一次 API 调用） |
 | `--yes` | 危险命令自动放行，不弹交互确认 |
 | `--verbose, -v` | 打印 agent 执行的每条命令 |
-| `--max-steps=N` | 限制最多 N 轮工具调用（默认 30） |
+| `--max-steps=N` | 限制最多 N 轮工具调用（默认 100） |
 | `--show-memory` | 只打印累积的经验记忆库后退出 |
 | `--tui` / `--cli` | 强制 TUI / CLI 模式 |
 | `--help, -h` | 显示帮助 |
@@ -61,20 +61,39 @@ skymind "帮我统计当前目录有多少个文件"   # 单次执行（CLI 模�
 
 - **TUI**：纯 ANSI 实现、零依赖，备用屏幕、滚动日志、危险命令弹窗确认、任务可中断
 - **工具调用**：支持并行 tool calls，逐条执行并把 stdout/stderr 回传给模型
-- **健壮性**：API 自动重试 3 次（指数退避）、单请求 5 分钟超时、单命令 2 分钟超时、输出截断防止撑爆上下文、任务可 Ctrl+C 中断
+- **健壮性**：API 最多尝试 3 次（间隔 1 秒、2 秒；400/401/403 等非临时错误直接报告）、单请求 5 分钟超时（包含响应正文读取）、单命令 2 分钟超时、输出截断防止撑爆上下文；网络请求和重试等待可 Ctrl+C 中断
 - **安全防护**：危险命令（`rm -rf /`、`mkfs`、`dd` 写设备、`shutdown`、fork 炸弹等）需交互确认，非交互环境默认拒绝
 - **死循环保护**：连续 3 次执行同一命令自动判定为卡死并引导模型收尾
 - **自改进记忆**：每次任务后自动反思，把可复用的经验写入 `~/.10xagent/memory.md`，下次会话注入 system prompt
 
 ## 安装 / 更新
 
-`skymind` 是 `agent.js` 的软链接（安装在 `~/bin/skymind`）：
+需要 Node.js 18 或更新版本，无需安装 npm 依赖。Linux/macOS 下克隆仓库并安装 `skymind` 软链接：
 
 ```bash
-ln -sf /home/veins/codex_projects/10xagent/agent.js ~/bin/skymind
+git clone https://github.com/clownhh/SkyMind-agent.git
+cd SkyMind-agent
+mkdir -p "$HOME/bin"
+chmod +x agent.js
+ln -sf "$PWD/agent.js" "$HOME/bin/skymind"
+export PATH="$HOME/bin:$PATH"
 ```
 
 ## 文件说明
 
 - `agent.js` — 主脚本（核心引擎 + TUI + CLI 一体）
-- `agent.js.tui-backup` / `agent.js.old` / `agent.js.bak` — 历史备份
+- `api-client.js` — API 请求、超时、重试和中断处理
+- `test-api.js` — 使用本地 HTTP 服务验证请求和异常处理
+- `test-render.js` — 直接验证真实 TUI 的渲染、滚动和危险命令确认状态
+
+## 开发验证
+
+测试不需要 API 密钥，不会调用远程模型或执行模型生成的命令：
+
+```bash
+node --check agent.js
+node --test test-api.js
+node test-render.js
+```
+
+GitHub Actions 在 Linux 和 Windows 上验证 Node.js 18、22、24。
